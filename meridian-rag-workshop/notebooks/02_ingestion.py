@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Lab 1: Corpus ingestion
 # MAGIC
@@ -76,22 +80,22 @@ display(spark.sql(f"SELECT path, length, modificationTime FROM read_files('{cfg.
 # COMMAND ----------
 
 def ingest_bronze():
-    q = (spark.readStream.format("cloudFiles")
-         .option("cloudFiles.format", "binaryFile")
-         .load(cfg.raw_path)
-         .select("path", "modificationTime", "length", "content")
-         .withColumn("file_name", F.element_at(F.split("path", "/"), -1))
-         .withColumn("file_ext", F.lower(F.element_at(F.split("file_name", r"\."), -1)))
-         .withColumn("doc_id_hint", F.when(F.col("file_name").startswith("MGB-"), F.split("file_name", "_")[0]))
-         .withColumn("content_sha256", F.sha2("content", 256))
-         .withColumn("ingested_at", F.current_timestamp())
-         .writeStream
-         .option("checkpointLocation", CKPT)
-         .trigger(availableNow=True)
-         .toTable(BRONZE))
-    q.awaitTermination()
-    n = sum(p.get("numInputRows", 0) for p in q.recentProgress)
-    ok(f"Auto Loader processed {n} new file(s). {BRONZE} now has {spark.table(BRONZE).count()} rows.")
+    """Incremental load: append only files Bronze hasn't seen (same path and same content hash).
+    Re-running is safe; changed files (new hash) are picked up as new versions.
+    In production you'd use Auto Loader (cloudFiles) for this; see the deck."""
+    src = (spark.read.format("binaryFile").load(cfg.raw_path)
+           .select("path", "modificationTime", "length", "content")
+           .withColumn("file_name", F.element_at(F.split("path", "/"), -1))
+           .withColumn("file_ext", F.lower(F.element_at(F.split("file_name", r"\."), -1)))
+           .withColumn("doc_id_hint", F.when(F.col("file_name").startswith("MGB-"), F.split("file_name", "_")[0]))
+           .withColumn("content_sha256", F.sha2("content", 256))
+           .withColumn("ingested_at", F.current_timestamp()))
+    if spark.catalog.tableExists(BRONZE):
+        src = src.join(spark.table(BRONZE).select("path", "content_sha256"), ["path", "content_sha256"], "left_anti")
+    n = src.count()
+    if n:
+        src.write.mode("append").saveAsTable(BRONZE)
+    ok(f"Processed {n} new file(s). {BRONZE} now has {spark.table(BRONZE).count()} rows.")
     return n
 
 ingest_bronze()
