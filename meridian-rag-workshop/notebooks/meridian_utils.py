@@ -78,7 +78,7 @@ def warn(msg): print(f"  \u26a0\ufe0f  {msg}")
 def fail(msg): print(f"  \u274c {msg}")
 
 
-REQUIRED_HELPERS = ["detect_endpoints", "chat", "embed", "diagnose_embeddings", "build_naive_chunks",
+REQUIRED_HELPERS = ["detect_endpoints", "chat", "embed", "diagnose_embeddings", "build_naive_chunks", "guard_lab2", "evaluate_pipeline", "build_chunk_tables",
                     "export_embedded_checkpoint", "load_cfg", "save_cfg", "launch_job", "job_status",
                     "get_scorers", "guard_lab0", "guard_lab1"]
 
@@ -558,6 +558,9 @@ def guard_lab1():
     print("Guard check for Lab 1")
     cfg = load_cfg(); ok("config loaded")
     life, res = job_status("run_evaluation")
+    if life is None and table_exists(cfg, "scorecard") and \
+            _spark().table(cfg.table("scorecard")).filter("run_name = 'baseline'").count():
+        life, res = "TERMINATED", "SUCCESS"          # job record missing, but its results are in the scorecard
     if life is None:
         warn("No baseline evaluation job found. Launch it from 01_baseline (last cell), then carry on here.")
     elif res == "SUCCESS":
@@ -569,3 +572,382 @@ def guard_lab1():
     import mlflow
     mlflow.set_experiment(cfg.experiment_path)
     return cfg
+
+
+# ==============================================================================================
+# PHASE 2: data processing (parse -> elements -> clean -> metadata -> dedupe -> filter)
+# ==============================================================================================
+NOISE_TYPES = {"page_header", "page_footer", "page_number"}
+
+DOC_TYPE_BY_CODE = {  # third token of the doc ID, or the second for two-part IDs
+    "POL": ("policy", 1), "ADD": ("addendum", 2), "STD": ("standard", 1), "PROC": ("procedure", 3),
+    "MAT": ("matrix", 1), "GDE": ("guide", 3), "LST": ("policy", 1), "REF": ("reference_card", 4),
+    "FAQ": ("faq", 4), "GLO": ("glossary", 4), "COM": ("bulletin", 4),
+    "DRAFT": ("draft", 0), "HR": ("hr_policy", 0), "CASE": ("case_file", 0),
+}
+DOMAIN_BY_CODE = {"KYC": "kyc", "SAN": "sanctions", "TF": "trade", "CR": "credit", "OPS": "operations",
+                  "FAQ": "general", "GLO": "general", "COM": "general", "DRAFT": "kyc", "HR": "hr", "CASE": "kyc"}
+META_KEYS = {"document id": "doc_id", "version": "version", "status": "status", "effective date": "effective_date",
+             "superseded on": "superseded_date", "owner": "owner", "jurisdiction": "jurisdiction",
+             "classification": "sensitivity"}
+
+
+def _cell_text(c):
+    return " ".join(c.get_text(" ", strip=True).split())
+
+
+def html_table_grid(html: str):
+    """Expand an HTML table into a full grid, copying colspan/rowspan cells into every position they cover.
+    Returns (rows, header_flags): rows is a list of lists of strings; header_flags marks all-<th> rows."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    grid, flags, carry = [], [], {}          # carry[(row, col)] = text for rowspans from rows above
+    for r, tr in enumerate(soup.find_all("tr")):
+        row, col = [], 0
+        cells = tr.find_all(["th", "td"])
+        is_header = bool(cells) and all(c.name == "th" for c in cells)
+        for c in cells:
+            while (r, col) in carry:
+                row.append(carry.pop((r, col))); col += 1
+            text, cs, rs = _cell_text(c), int(c.get("colspan", 1) or 1), int(c.get("rowspan", 1) or 1)
+            for k in range(cs):
+                row.append(text)
+                for down in range(1, rs):
+                    carry[(r + down, col + k)] = text
+            col += cs
+        while (r, col) in carry:
+            row.append(carry.pop((r, col))); col += 1
+        grid.append(row); flags.append(is_header)
+    width = max((len(x) for x in grid), default=0)
+    grid = [x + [""] * (width - len(x)) for x in grid]
+    # an empty body cell under a merged cell in the source PDF is filled from the cell above
+    for r in range(1, len(grid)):
+        if not flags[r]:
+            for c in range(width):
+                if grid[r][c] == "" and not flags[r - 1]:
+                    grid[r][c] = grid[r - 1][c]
+    return grid, flags
+
+
+def table_to_markdown(html: str) -> str:
+    """HTML table -> markdown. Multi-row headers are combined ('Approval authority / Primary approver'),
+    merged cells are repeated, so every row reads on its own once chunked."""
+    grid, flags = html_table_grid(html)
+    if not grid:
+        return ""
+    n_head = 0
+    while n_head < len(flags) and flags[n_head]:
+        n_head += 1
+    if n_head:
+        header = []
+        for c in range(len(grid[0])):
+            parts = []
+            for r in range(n_head):
+                if grid[r][c] and grid[r][c] not in parts:
+                    parts.append(grid[r][c])
+            header.append(" / ".join(parts))
+        body = grid[n_head:]
+    else:
+        header, body = grid[0], grid[1:]
+    esc = lambda s: s.replace("|", "\\|")
+    lines = ["| " + " | ".join(esc(h) for h in header) + " |", "|" + "---|" * len(header)]
+    lines += ["| " + " | ".join(esc(x) for x in row) + " |" for row in body]
+    return "\n".join(lines)
+
+
+def parse_cover_table(html: str) -> dict:
+    """Read the cover block (a two-column key/value table, with or without <thead>) into metadata fields."""
+    grid, _ = html_table_grid(html)
+    meta = {}
+    for row in grid:
+        if len(row) >= 2 and row[0].strip().lower() in META_KEYS:
+            meta[META_KEYS[row[0].strip().lower()]] = row[1].strip()
+    return meta
+
+
+def normalise_meta(meta: dict) -> dict:
+    m = dict(meta)
+    if m.get("status"): m["status"] = m["status"].strip().lower()
+    if m.get("sensitivity"): m["sensitivity"] = m["sensitivity"].strip().lower().replace(" ", "_")
+    if m.get("jurisdiction"): m["jurisdiction"] = m["jurisdiction"].strip().upper()
+    if m.get("superseded_date", "").lower() in ("not applicable", "n/a", ""): m["superseded_date"] = None
+    return m
+
+
+def derive_from_doc_id(doc_id: str) -> dict:
+    parts = (doc_id or "").split("-")
+    code = parts[2] if len(parts) >= 4 else (parts[1] if len(parts) > 1 else "")
+    dtype, rank = DOC_TYPE_BY_CODE.get(code, ("unknown", 3))
+    domain = DOMAIN_BY_CODE.get(parts[1] if len(parts) > 1 else "", "general")
+    return {"doc_type": dtype, "authority_rank": rank, "domain": domain}
+
+
+def html_to_elements(data: bytes):
+    """Our own 'parser' for HTML pages (ai_parse_document doesn't take HTML): same element types as the PDFs.
+    Navigation, footers and scripts are dropped, which is the HTML version of removing page headers."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(data, "html.parser")
+    meta = {m["name"][4:]: m.get("content", "") for m in soup.find_all("meta") if m.get("name", "").startswith("mgb:")}
+    for t in soup(["nav", "footer", "style", "script"]):
+        t.decompose()
+    els = []
+    for t in soup.find_all(["h1", "h2", "h3", "p", "li", "table"]):
+        if t.find_parent("table") is not None or (t.name == "p" and t.find_parent("header") is not None):
+            continue
+        typ = {"h1": "title", "h2": "section_header", "h3": "section_header", "table": "table"}.get(t.name, "text")
+        content = str(t) if typ == "table" else _cell_text(t)
+        if content:
+            els.append({"type": typ, "content": content})
+    return els, normalise_meta({{"doc_id": "doc_id", "version": "version", "status": "status", "effective": "effective_date",
+                                 "owner": "owner", "jurisdiction": "jurisdiction", "sensitivity": "sensitivity"}.get(k, k): v
+                                for k, v in meta.items()})
+
+
+def markdown_to_elements(md: str):
+    """Fallback for the cp_02 reference parse: turn markdown back into typed elements."""
+    els, table = [], []
+    for line in md.splitlines() + [""]:
+        if line.startswith("|"):
+            table.append(line); continue
+        if table:
+            els.append({"type": "table_md", "content": "\n".join(table)}); table = []
+        if line.startswith("# "): els.append({"type": "title", "content": line[2:]})
+        elif line.startswith("## ") or line.startswith("### "): els.append({"type": "section_header", "content": line.lstrip("# ")})
+        elif line.strip(): els.append({"type": "text", "content": line.strip()})
+    return els
+
+
+def elements_to_markdown(els) -> str:
+    out = []
+    for e in els:
+        t, c = e["type"], (e.get("content") or "")
+        if not c:
+            continue
+        if t == "title": out.append(f"# {c}")
+        elif t == "section_header": out.append(f"## {c}")
+        elif t == "table": out.append(table_to_markdown(c))
+        elif t == "table_md": out.append(c)
+        elif t == "footnote": out.append("> " + c.replace("\n", "\n> "))
+        else: out.append(c)
+    return "\n\n".join(x for x in out if x)
+
+
+# ---- near-duplicate detection with MinHash ------------------------------------------------------
+def shingles(text: str, k=5):
+    words = re.findall(r"\w+", text.lower())
+    return {" ".join(words[i:i + k]) for i in range(max(1, len(words) - k + 1))}
+
+
+def minhash_signature(sh, num_perm=128):
+    import hashlib
+    sig = []
+    for p in range(num_perm):
+        salt = p.to_bytes(4, "little")
+        sig.append(min(int.from_bytes(hashlib.blake2b(salt + s.encode(), digest_size=8).digest(), "little") for s in sh) if sh else 0)
+    return sig
+
+
+def minhash_similarity(a, b):
+    return sum(x == y for x, y in zip(a, b)) / len(a)
+
+
+# ---- chunking variants (consumed by Phase 3) --------------------------------------------------
+def chunk_fixed_text(text, size=1000, overlap=0):
+    step = max(1, size - overlap)
+    return [text[i:i + size] for i in range(0, len(text), step) if text[i:i + size].strip()]
+
+
+def chunk_recursive_text(text, size=800, overlap=100):
+    """Split on paragraph, then line, then sentence boundaries, packing pieces up to `size` characters."""
+    def split(t, seps):
+        if len(t) <= size or not seps:
+            return [t]
+        parts, out = t.split(seps[0]), []
+        for p in parts:
+            out.extend(split(p, seps[1:]) if len(p) > size else [p])
+        return out
+    pieces = [p for p in split(text, ["\n\n", "\n", ". "]) if p.strip()]
+    chunks, cur = [], ""
+    for p in pieces:
+        if cur and len(cur) + len(p) + 2 > size:
+            chunks.append(cur); cur = cur[-overlap:] + "\n\n" + p if overlap else p
+        else:
+            cur = f"{cur}\n\n{p}" if cur else p
+    if cur.strip(): chunks.append(cur)
+    return chunks
+
+
+def chunk_structure(doc, els, max_chars=1500):
+    """One chunk per section: never splits a table, and prefixes each chunk with the document context."""
+    prefix = (f"[{doc['title']} | {doc['doc_id']} v{doc['version']} | {doc['status']} | "
+              f"jurisdiction {doc['jurisdiction']} | effective {doc['effective_date']}]")
+    sections, cur_head, cur = [], doc["title"], []
+    for e in els:
+        if e["type"] == "title":
+            continue
+        if e["type"] == "section_header":
+            if cur: sections.append((cur_head, cur))
+            cur_head, cur = e["content"], []
+        else:
+            cur.append(e)
+    if cur: sections.append((cur_head, cur))
+    chunks = []
+    for head, items in sections:
+        body = elements_to_markdown(items)
+        if len(body) <= max_chars or any(i["type"] in ("table", "table_md") for i in items):
+            chunks.append(f"{prefix}\n## {head}\n\n{body}")
+        else:
+            for part in chunk_recursive_text(body, size=max_chars, overlap=150):
+                chunks.append(f"{prefix}\n## {head}\n\n{part}")
+    return chunks
+
+
+def doc_key(doc_id, version, versioned_ids):
+    return f"{doc_id}@{version}" if doc_id in versioned_ids else doc_id
+
+
+def build_chunk_tables(cfg: Cfg):
+    """Writes p2_chunks_fixed, p2_chunks_recursive and p2_chunks_structure from silver_documents."""
+    import pandas as pd
+    sp = _spark()
+    docs = sp.table(cfg.table("silver_documents")).filter("include_in_index").toPandas()
+    els = sp.table(cfg.table("silver_elements_clean")).toPandas()
+    versioned = set(docs.groupby("doc_id")["version"].nunique().loc[lambda s: s > 1].index)
+    out = {"fixed": [], "recursive": [], "structure": []}
+    for _, d in docs.iterrows():
+        key = doc_key(d.doc_id, d.version, versioned)
+        de = els[els.file_name == d.file_name].sort_values("pos")[["type", "content"]].to_dict("records")
+        variants = {"fixed": chunk_fixed_text(d.doc_markdown, 1000, 0),
+                    "recursive": chunk_recursive_text(d.doc_markdown, 800, 100),
+                    "structure": chunk_structure(d, de)}
+        for name, chunks in variants.items():
+            for j, c in enumerate(chunks):
+                out[name].append({"chunk_id": f"{d.file_name}::{name}::{j}", "file_name": d.file_name, "doc_key": key,
+                                  "doc_id": d.doc_id, "version": d.version, "status": d.status,
+                                  "jurisdiction": d.jurisdiction, "doc_type": d.doc_type,
+                                  "authority_rank": int(d.authority_rank), "chunk_index": j, "text": c})
+    for name, rows in out.items():
+        sp.createDataFrame(pd.DataFrame(rows)).write.mode("overwrite").option("overwriteSchema", "true") \
+          .saveAsTable(cfg.table(f"p2_chunks_{name}"))
+        ok(f"p2_chunks_{name}: {len(rows)} chunks")
+
+
+def embed_chunk_table(cfg: Cfg, source: str, target: str):
+    pdf = _spark().table(cfg.table(source)).toPandas()
+    print(f"  Embedding {len(pdf)} chunks from {source} ...")
+    pdf["embedding"] = embed(pdf["text"].tolist(), cfg, progress=True)
+    _spark().createDataFrame(pdf).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(cfg.table(target))
+    ok(f"{target} ready")
+
+
+# Phase 2 pipeline: same naive retrieval and prompt, but over clean, parsed, filtered documents
+PIPELINES["parsed"] = lambda cfg: NaiveRAG(cfg, table="p2_chunks_embedded")
+
+
+def guard_lab2(use_checkpoint=False):
+    import pandas as pd
+    print("Guard check for Lab 2")
+    cfg = load_cfg(); ok("config loaded")
+    life, res = job_status("parse_documents")
+    if res == "SUCCESS" and table_exists(cfg, "silver_parsed") and not use_checkpoint:
+        ok(f"Parse job finished: {_spark().table(cfg.table('silver_parsed')).count()} parsed files")
+    elif life in ("PENDING", "RUNNING", "QUEUED", "BLOCKED") and not use_checkpoint:
+        warn("Parse job still running. Wait a minute and re-run this cell, or set use_checkpoint=True.")
+    else:
+        warn("Parse output missing or checkpoint requested: loading the reference parse from cp_02")
+        ref = pd.read_json(f"{cfg.work_path}/checkpoints/cp_02_reference_parse.jsonl", lines=True)
+        bronze = {r.file_name for r in _spark().table(cfg.table("source_registry")).filter("in_scope").collect()}
+        ref = ref[ref.file_name.isin(bronze) & ~ref.file_name.str.endswith(".html")]
+        _spark().createDataFrame(ref[["file_name", "parsed_markdown", "parse_source"]]).write.mode("overwrite") \
+            .option("overwriteSchema", "true").saveAsTable(cfg.table("silver_parsed"))
+        ok(f"silver_parsed loaded from checkpoint ({len(ref)} files)")
+    import mlflow
+    mlflow.set_experiment(cfg.experiment_path)
+    return cfg
+
+
+# ---- evaluation runner with per-category breakdown (used by every evaluation job) ---------------
+def _assessment_value(a):
+    v = getattr(getattr(a, "feedback", None), "value", None)
+    if v is None:
+        v = getattr(a, "value", None)
+    if isinstance(v, bool): return float(v)
+    if isinstance(v, (int, float)): return float(v)
+    if isinstance(v, str) and v.lower() in ("yes", "no"): return 1.0 if v.lower() == "yes" else 0.0
+    return None
+
+
+def category_breakdown(cfg: Cfg, run_id: str) -> dict:
+    """Mean of every scorer per eval category, read back from the run's traces. Averages hide failures;
+    this shows, for example, that jurisdiction questions fail while simple facts pass."""
+    import mlflow
+    cats = {}
+    with open(f"{cfg.work_path}/eval/meridian_eval_set.jsonl") as fh:
+        for line in fh:
+            r = json.loads(line); cats[r["inputs"]["question"]] = r["tags"]["category"]
+    try:
+        traces = mlflow.search_traces(run_id=run_id, return_type="list")
+    except TypeError:
+        traces = mlflow.search_traces(run_id=run_id)["trace"].tolist()
+    sums = {}
+    for t in traces:
+        try:
+            q = json.loads(t.data.request).get("question")
+        except Exception:  # noqa: BLE001
+            q = None
+        cat = cats.get(q)
+        if not cat:
+            continue
+        for a in (t.info.assessments or []):
+            v = _assessment_value(a)
+            if v is not None:
+                s = sums.setdefault((a.name, cat), [0.0, 0]); s[0] += v; s[1] += 1
+    return {f"{name}/{cat}": tot / n for (name, cat), (tot, n) in sums.items() if n}
+
+
+def evaluate_pipeline(cfg: Cfg, pipeline: str, run_name: str):
+    import mlflow
+    mlflow.set_experiment(cfg.experiment_path)
+    rag = PIPELINES[pipeline](cfg)
+    records = load_eval_records(cfg)
+    print(f"Evaluating pipeline '{pipeline}' on {len(records)} questions as run '{run_name}'")
+    with mlflow.start_run(run_name=run_name) as run:
+        mlflow.log_params({"pipeline": pipeline, "chat_endpoint": cfg.chat_endpoint, "embed_endpoint": cfg.embed_endpoint})
+        results = mlflow.genai.evaluate(data=records, predict_fn=rag.answer, scorers=get_scorers(cfg))
+        metrics = {k: v for k, v in results.metrics.items() if isinstance(v, (int, float))}
+        try:
+            by_cat = category_breakdown(cfg, run.info.run_id)
+            for k, v in by_cat.items():
+                mlflow.log_metric(f"by_category/{k}".replace(" ", "_"), v)
+            metrics.update({f"by_category/{k}": v for k, v in by_cat.items()})
+            ok(f"per-category breakdown: {len(by_cat)} values")
+        except Exception as e:  # noqa: BLE001
+            warn(f"Per-category breakdown skipped ({e})")
+    record_scorecard(cfg, run_name, metrics)
+    return metrics
+
+
+def show_category_scorecard(cfg: Cfg, metric="correctness"):
+    """One row per category: correct/total for each run. A difference of one question is within run-to-run noise."""
+    import pandas as pd
+    counts = {}
+    with open(f"{cfg.work_path}/eval/meridian_eval_set.jsonl") as fh:
+        for line in fh:
+            c = json.loads(line)["tags"]["category"]; counts[c] = counts.get(c, 0) + 1
+    df = _spark().sql(f"""
+        WITH latest AS (
+          SELECT run_name, metric, value, row_number() OVER (PARTITION BY run_name, metric ORDER BY logged_at DESC) AS rn
+          FROM {cfg.table('scorecard')} WHERE metric LIKE 'by_category/{metric}/%')
+        SELECT split(metric, '/')[2] AS category, run_name, value FROM latest WHERE rn = 1""").toPandas()
+    df["n"] = df.category.map(counts)
+    df["correct"] = (df.value * df.n).round().astype(int)
+    wide = df.pivot(index="category", columns="run_name", values="correct")
+    runs = [r for r in ["baseline", "after_p2", "after_p3", "after_p4", "after_p7", "after_p9", "after_p10", "final"] if r in wide.columns]
+    out = pd.DataFrame({"category": wide.index, "questions": [counts[c] for c in wide.index]})
+    for r in runs:
+        out[r] = [f"{int(v)}/{counts[c]}" if pd.notna(v) else "" for c, v in zip(wide.index, wide[r])]
+    if len(runs) >= 2:
+        first, last = wide[runs[0]], wide[runs[-1]]
+        out["change"] = [("noise" if abs(l - f) <= 1 else ("better" if l > f else "worse")) if pd.notna(f) and pd.notna(l) else ""
+                         for f, l in zip(first, last)]
+    return out.reset_index(drop=True)
