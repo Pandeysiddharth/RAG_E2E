@@ -80,6 +80,16 @@ def fail(msg): print(f"  \u274c {msg}")
 # ----------------------------------------------------------------------------------------------
 # Model endpoints (Foundation Model APIs, pay-per-token)
 # ----------------------------------------------------------------------------------------------
+
+def detect_endpoints():
+    """Pick the first available chat and embedding endpoints from the preference lists.
+    Free Edition offers a subset of models, so we detect rather than hard-code."""
+    from databricks.sdk import WorkspaceClient
+    eps = {e.name: (e.task or "") for e in WorkspaceClient().serving_endpoints.list()}
+    chat = next((n for n in CHAT_PREFS if n in eps), None) or next((n for n, t in eps.items() if "chat" in t), None)
+    emb = next((n for n in EMBED_PREFS if n in eps), None) or next((n for n, t in eps.items() if "embedding" in t), None)
+    return chat, emb, eps
+    
 _RETRYABLE = {429, 500, 502, 503, 504}
 
 
