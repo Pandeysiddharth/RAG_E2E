@@ -1,8 +1,4 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "6"
-# ///
 # MAGIC %md
 # MAGIC # Lab 2: Data processing
 # MAGIC
@@ -28,7 +24,10 @@
 
 # COMMAND ----------
 
+import importlib, meridian_utils
+importlib.reload(meridian_utils)        # always use the file on disk
 from meridian_utils import *
+self_check()                            # clear message if meridian_utils.py is out of date
 import pandas as pd
 cfg = guard_lab2(use_checkpoint=False)
 PARSED = spark.table(cfg.table("silver_parsed"))
@@ -158,7 +157,14 @@ for fname, g in elements.sort_values("pos").groupby("file_name"):
         source = "inferred from text"
     meta["doc_id"] = meta.get("doc_id") or bronze_hint.get(fname)
     titles = g[g.type == "title"].content
-    docs.append({"file_name": fname, "title": titles.iloc[0] if len(titles) else fname, "meta_source": source,
+    if len(titles):
+        title = titles.iloc[0]
+    else:   # some DOCX files have no element typed 'title': use the first short heading or line before the cover block
+        first_table = g[g.type == "table"].pos.min() if len(tables) else g.pos.max() + 1
+        cands = g[(g.pos < first_table) & g.type.isin(["section_header", "text", "page_header"])].content.astype(str)
+        cands = [c.strip() for c in cands if 3 < len(c.strip()) < 90 and "Meridian Global Bank" not in c]
+        title = cands[0] if cands else fname
+    docs.append({"file_name": fname, "title": title, "meta_source": source,
                  **{k: meta.get(k) for k in ["doc_id", "version", "status", "effective_date", "superseded_date",
                                               "owner", "jurisdiction", "sensitivity"]},
                  **derive_from_doc_id(meta.get("doc_id"))})
@@ -314,54 +320,3 @@ launch_job("phase2_followup", {}, run_name="meridian-phase2-followup")
 # MAGIC | Extracted and validated metadata | Filters, versions and citations depend on it, so it has to be right |
 # MAGIC | Told duplicates from versions | Removed the copy without losing the history Q15 needs |
 # MAGIC | Filtered drafts and personal data | The 9-month draft and the passport number can no longer be retrieved |
-
-# COMMAND ----------
-
-launch_job("run_evaluation", {"pipeline": "naive", "run_name": "baseline"}, run_name="meridian-baseline-rescore")
-
-# COMMAND ----------
-
-display(show_category_scorecard(cfg))
-
-# COMMAND ----------
-
-import mlflow, json
-
-def per_question(run_name, scorer="correctness"):
-    run = mlflow.search_runs(experiment_names=[cfg.experiment_path],
-                             filter_string=f"tags.mlflow.runName = '{run_name}'",
-                             order_by=["start_time DESC"], max_results=1).iloc[0]
-    out = {}
-    for t in mlflow.search_traces(run_id=run.run_id, return_type="list"):
-        q = json.loads(t.data.request).get("question")
-        for a in t.info.assessments or []:
-            if a.name == scorer:
-                out[q] = (a.feedback.value, getattr(a, "rationale", "") or "")
-    return out
-
-base, p2 = per_question("baseline"), per_question("after_p2")
-for q, (v, _) in base.items():
-    if q in p2 and v != p2[q][0]:
-        print(f"{v} -> {p2[q][0]}   {q}\n   judge: {p2[q][1][:400]}\n")
-
-# COMMAND ----------
-
-import json
-for path in [f"{cfg.work_path}/eval/meridian_eval_set.jsonl", f"{cfg.bundle_root}/eval/meridian_eval_set.jsonl"]:
-    recs = [json.loads(l) for l in open(path)]
-    for r in recs:
-        if r["inputs"]["question"].startswith("What was the medium-risk KYC refresh cycle before"):
-            r["expectations"]["expected_facts"] = ["Before March 2025 medium-risk refresh was 36 months"]
-    with open(path, "w") as fh:
-        fh.write("\n".join(json.dumps(r) for r in recs) + "\n")
-    ok(f"Updated {path}")
-
-# COMMAND ----------
-
-launch_job("run_evaluation", {"pipeline": "naive", "run_name": "baseline"}, run_name="meridian-baseline-rescore")
-# when that finishes:
-launch_job("run_evaluation", {"pipeline": "parsed", "run_name": "after_p2"}, run_name="meridian-after-p2-rescore")
-
-# COMMAND ----------
-
-display(show_category_scorecard(cfg))

@@ -38,6 +38,7 @@ class Cfg:
     ai_search_endpoint: str = AI_SEARCH_ENDPOINT
     embed_batch: int = 4           # tuned by diagnose_embeddings() in 00_setup
     embed_pause: float = 0.0       # seconds between embedding calls, if the rate limit needs it
+    index_embed_endpoint: str = ""  # embedding model chosen in Lab 4 for the AI Search index
     experiment_path: str = ""
     bundle_root: str = ""
 
@@ -78,7 +79,7 @@ def warn(msg): print(f"  \u26a0\ufe0f  {msg}")
 def fail(msg): print(f"  \u274c {msg}")
 
 
-REQUIRED_HELPERS = ["detect_endpoints", "chat", "embed", "diagnose_embeddings", "build_naive_chunks", "guard_lab2", "evaluate_pipeline", "build_chunk_tables",
+REQUIRED_HELPERS = ["detect_endpoints", "chat", "embed", "diagnose_embeddings", "build_naive_chunks", "guard_lab2", "evaluate_pipeline", "build_chunk_tables", "guard_lab3", "retrieval_eval", "chunk_report", "guard_lab4", "retrieval_eval_ranked", "ai_search_client", "guard_lab5", "get_index", "index_search", "index_retrieval_eval", "guard_lab6", "plan_query", "expand_acronyms", "guard_lab7", "retrieve_ranked", "retrieval_grid",
                     "export_embedded_checkpoint", "load_cfg", "save_cfg", "launch_job", "job_status",
                     "get_scorers", "guard_lab0", "guard_lab1"]
 
@@ -368,7 +369,8 @@ def load_eval_records(cfg: Cfg):
 
 
 REFUSAL = ["i don't know", "i do not know", "cannot", "can't", "unable", "not able", "outside", "out of scope",
-           "not covered", "no information", "don't have", "do not have", "not provide", "not in the"]
+           "not covered", "no information", "don't have", "do not have", "not provide", "not in the",
+           "does not contain", "doesn't contain", "not disclosed"]
 
 
 def get_scorers(cfg: Cfg):
@@ -942,7 +944,7 @@ def show_category_scorecard(cfg: Cfg, metric="correctness"):
     df["n"] = df.category.map(counts)
     df["correct"] = (df.value * df.n).round().astype(int)
     wide = df.pivot(index="category", columns="run_name", values="correct")
-    runs = [r for r in ["baseline", "after_p2", "after_p3", "after_p4", "after_p7", "after_p9", "after_p10", "final"] if r in wide.columns]
+    runs = [r for r in ["baseline", "after_p2", "after_p3", "after_p5", "after_p6", "after_p7", "after_p8", "after_p9", "after_p10", "final"] if r in wide.columns]
     out = pd.DataFrame({"category": wide.index, "questions": [counts[c] for c in wide.index]})
     for r in runs:
         out[r] = [f"{int(v)}/{counts[c]}" if pd.notna(v) else "" for c, v in zip(wide.index, wide[r])]
@@ -951,3 +953,658 @@ def show_category_scorecard(cfg: Cfg, metric="correctness"):
         out["change"] = [("noise" if abs(l - f) <= 1 else ("better" if l > f else "worse")) if pd.notna(f) and pd.notna(l) else ""
                          for f, l in zip(first, last)]
     return out.reset_index(drop=True)
+
+
+# ==============================================================================================
+# PHASE 3: chunking (compare strategies with fast, retrieval-only evaluation)
+# ==============================================================================================
+CHUNK_TABLES = {"baseline (naive)": "naive_chunks", "fixed": "p2_chunks_embedded",
+                "recursive": "p3_emb_recursive", "structure": "p3_emb_structure"}
+
+
+def chunk_report(cfg: Cfg, table: str) -> dict:
+    """Size statistics, plus how many chunks hold a fragment of a table without its header row."""
+    import pandas as pd
+    t = _spark().table(cfg.table(table)).select("text").toPandas().text
+    lens = t.str.len()
+    def table_fragment(x):
+        lines = [l for l in x.splitlines() if l.strip().startswith("|")]
+        return bool(lines) and not any(l.strip().startswith("|---") for l in lines)
+    return {"chunks": len(t), "avg_chars": int(lens.mean()), "min_chars": int(lens.min()), "max_chars": int(lens.max()),
+            "approx_max_tokens": int(lens.max() / 4), "table_fragments": int(t.apply(table_fragment).sum())}
+
+
+def retrieval_eval(cfg: Cfg, table: str, k=5, embed_cfg=None):
+    """Retrieval-only evaluation: no LLM calls, just 'did the right document reach the top k?'.
+    Returns one row per question that has expected documents."""
+    import pandas as pd
+    ecfg = embed_cfg or cfg
+    pdf = _spark().table(cfg.table(table)).select("doc_key", "text", "embedding").toPandas()
+    m = np.array(pdf.embedding.tolist(), dtype=np.float32)
+    m /= np.linalg.norm(m, axis=1, keepdims=True)
+    recs = []
+    with open(f"{cfg.work_path}/eval/meridian_eval_set.jsonl") as fh:
+        for line in fh:
+            r = json.loads(line)
+            if r["expectations"]["expected_doc_ids"]:
+                recs.append(r)
+    q = np.array(embed([r["inputs"]["question"] for r in recs], ecfg), dtype=np.float32)
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    scores = q @ m.T
+    rows = []
+    for i, r in enumerate(recs):
+        idx = np.argsort(-scores[i])[:k]
+        got = list(pdf.doc_key.iloc[idx])
+        exp = set(r["expectations"]["expected_doc_ids"])
+        rank = next((j + 1 for j, g in enumerate(got) if g in exp), None)
+        rows.append({"question_id": r["tags"]["question_id"], "category": r["tags"]["category"],
+                     "recall": len(exp & set(got)) / len(exp), "reciprocal_rank": 1 / rank if rank else 0.0,
+                     "distinct_docs": len(set(got)), "top_docs": got})
+    return pd.DataFrame(rows)
+
+
+def summarise_retrieval(results: dict):
+    """results: {strategy: retrieval_eval DataFrame} -> (overall table, per-category recall table)."""
+    import pandas as pd
+    overall = pd.DataFrame([{"strategy": s, "recall@5": round(d.recall.mean(), 3), "MRR": round(d.reciprocal_rank.mean(), 3),
+                             "fully_retrieved": f"{int((d.recall == 1).sum())}/{len(d)}",
+                             "avg_distinct_docs_in_top5": round(d.distinct_docs.mean(), 1)} for s, d in results.items()])
+    by_cat = pd.DataFrame({s: d.groupby("category").recall.mean().round(2) for s, d in results.items()})
+    return overall, by_cat.reset_index()
+
+
+def p3_winner_table(cfg: Cfg):
+    try:
+        with open(f"{cfg.work_path}/p3_winner.json") as fh:
+            return json.load(fh)["table"]
+    except FileNotFoundError:
+        return "p3_emb_structure"
+
+
+PIPELINES["chunked"] = lambda cfg: NaiveRAG(cfg, table=p3_winner_table(cfg))
+
+
+def endpoint_cfg(cfg: Cfg, embed_endpoint: str) -> Cfg:
+    """A copy of the config that embeds with a different model (used by Phase 4)."""
+    from dataclasses import replace
+    return replace(cfg, embed_endpoint=embed_endpoint)
+
+
+def guard_lab3():
+    print("Guard check for Lab 3")
+    cfg = load_cfg(); ok("config loaded")
+    life, res = job_status("phase2_followup")
+    have = all(table_exists(cfg, f"p2_chunks_{v}") for v in ("fixed", "recursive", "structure"))
+    if res == "SUCCESS":
+        ok("Phase 2 follow-up job finished: chunk variants and after_p2 evaluation are ready")
+    elif life in ("PENDING", "RUNNING", "QUEUED", "BLOCKED"):
+        warn(f"Phase 2 follow-up job still {life.lower()}." + (" Chunk tables already exist, so carry on." if have else " Wait a minute and re-run."))
+    elif not have:
+        warn("Chunk variant tables missing: building them now from silver_documents")
+        build_chunk_tables(cfg)
+    if not table_exists(cfg, "p2_chunks_embedded") and table_exists(cfg, "p2_chunks_fixed"):
+        warn("Fixed-size chunks not embedded yet: embedding now (cached embeddings are reused)")
+        embed_chunk_table(cfg, "p2_chunks_fixed", "p2_chunks_embedded")
+    import mlflow
+    mlflow.set_experiment(cfg.experiment_path)
+    return cfg
+
+
+# ==============================================================================================
+# PHASE 4: embedding models (stricter retrieval metrics, truncation, latency)
+# ==============================================================================================
+MODEL_TABLES = {"databricks-gte-large-en": "p3_emb_structure",
+                "databricks-bge-large-en": "p4_emb_bge",
+                "databricks-qwen3-embedding-0-6b": "p4_emb_qwen3"}
+MODEL_TOKEN_LIMITS = {"databricks-gte-large-en": 8192, "databricks-bge-large-en": 512,
+                      "databricks-qwen3-embedding-0-6b": 32768}   # approximate published input limits
+
+
+def approx_tokens(text: str) -> int:
+    """Rough token estimate (about 4 characters per token for English). Good enough for limit checks."""
+    return max(1, len(text or "") // 4)
+
+
+def retrieval_eval_ranked(cfg: Cfg, table: str, embed_cfg=None, depth=20):
+    """Stricter retrieval evaluation. Per question: recall at 1, 3 and 5, reciprocal rank, and for questions
+    that expect a specific version, whether that version outranks the other version of the same document."""
+    import pandas as pd
+    ecfg = embed_cfg or cfg
+    pdf = _spark().table(cfg.table(table)).select("doc_key", "embedding").toPandas()
+    m = np.array(pdf.embedding.tolist(), dtype=np.float32); m /= np.linalg.norm(m, axis=1, keepdims=True)
+    keys = pdf.doc_key.tolist()
+    recs = []
+    with open(f"{cfg.work_path}/eval/meridian_eval_set.jsonl") as fh:
+        for line in fh:
+            r = json.loads(line)
+            if r["expectations"]["expected_doc_ids"]:
+                recs.append(r)
+    q = np.array(embed([r["inputs"]["question"] for r in recs], ecfg), dtype=np.float32)
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    scores = q @ m.T
+    rows = []
+    for i, r in enumerate(recs):
+        order = [keys[j] for j in np.argsort(-scores[i])[:depth]]
+        exp = set(r["expectations"]["expected_doc_ids"])
+        rec_at = lambda k: len(exp & set(order[:k])) / len(exp)
+        first = next((j + 1 for j, g in enumerate(order) if g in exp), None)
+        version_ok = None
+        versioned = [e for e in exp if "@" in e]
+        if versioned:
+            base = versioned[0].split("@")[0]
+            exp_rank = next((j for j, g in enumerate(order) if g in exp and g.startswith(base)), 999)
+            other_rank = next((j for j, g in enumerate(order) if g.startswith(base + "@") and g not in exp), 999)
+            version_ok = exp_rank < other_rank
+        rows.append({"question_id": r["tags"]["question_id"], "category": r["tags"]["category"],
+                     "recall@1": rec_at(1), "recall@3": rec_at(3), "recall@5": rec_at(5),
+                     "reciprocal_rank": 1 / first if first else 0.0, "version_ok": version_ok, "top5": order[:5]})
+    return pd.DataFrame(rows)
+
+
+def summarise_models(results: dict):
+    import pandas as pd
+    out = []
+    for model, d in results.items():
+        v = d.version_ok.dropna()
+        out.append({"model": model.replace("databricks-", ""),
+                    "recall@1": round(d["recall@1"].mean(), 3), "recall@3": round(d["recall@3"].mean(), 3),
+                    "recall@5": round(d["recall@5"].mean(), 3), "MRR": round(d.reciprocal_rank.mean(), 3),
+                    "right_version_first": f"{int(v.sum())}/{len(v)}"})
+    return pd.DataFrame(out)
+
+
+def truncation_probe(cfg: Cfg, endpoint: str, text: str, head_chars=1600):
+    """Embeds a long text, its first part, and its last part. If the model silently truncates, the full text's
+    embedding is almost identical to the first part's and unrelated to the last part's."""
+    ecfg = endpoint_cfg(cfg, endpoint)
+    head, tail = text[:head_chars], text[-head_chars:]
+    try:
+        full_v, head_v, tail_v = [np.array(v, dtype=np.float32) for v in embed([text, head, tail], ecfg, progress=False)]
+    except Exception as e:  # noqa: BLE001
+        return {"model": endpoint.replace("databricks-", ""), "error": str(e)[:150]}
+    cos = lambda a, b: float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    return {"model": endpoint.replace("databricks-", ""), "text_tokens_approx": approx_tokens(text),
+            "limit_tokens": MODEL_TOKEN_LIMITS.get(endpoint),
+            "similarity_full_vs_first_part": round(cos(full_v, head_v), 3),
+            "similarity_full_vs_last_part": round(cos(full_v, tail_v), 3)}
+
+
+def query_latency(cfg: Cfg, endpoint: str, n=3):
+    """Median seconds to embed one new (uncached) question."""
+    import statistics, uuid
+    times = []
+    for i in range(n):
+        t0 = time.time()
+        _invoke(endpoint, {"input": [f"How often must a high-risk client be reviewed? ({uuid.uuid4().hex[:6]})"]}, quiet=True)
+        times.append(time.time() - t0)
+    return round(statistics.median(times), 2)
+
+
+def ai_search_client():
+    try:
+        from databricks.ai_search.client import AISearchClient
+        return AISearchClient(disable_notice=True)
+    except ImportError:
+        from databricks.vector_search.client import VectorSearchClient
+        return VectorSearchClient(disable_notice=True)
+
+
+INDEX_SOURCE = "p5_index_source"
+INDEX_NAME = "meridian_chunks_index"
+
+
+def guard_lab4():
+    print("Guard check for Lab 4")
+    cfg = load_cfg(); ok("config loaded")
+    life, res = job_status("phase3_followup")
+    if res == "SUCCESS":
+        ok("Phase 3 follow-up job finished: after_p3 evaluated, other models embedded")
+    elif life in ("PENDING", "RUNNING", "QUEUED", "BLOCKED"):
+        warn(f"Phase 3 follow-up job still {life.lower()}. Models whose tables exist can be compared now.")
+    try:
+        state = ai_search_client().get_endpoint(cfg.ai_search_endpoint).get("endpoint_status", {}).get("state")
+        (ok if state == "ONLINE" else warn)(f"AI Search endpoint {cfg.ai_search_endpoint}: {state}" +
+            ("" if state == "ONLINE" else "  (the index build at the end of this lab waits for it; tell a helper if it isn't ONLINE soon)"))
+    except Exception as e:  # noqa: BLE001
+        warn(f"Couldn't check the AI Search endpoint ({str(e)[:100]})")
+    for ep, t in MODEL_TABLES.items():
+        (ok if table_exists(cfg, t) else warn)(f"{ep.replace('databricks-', ''):24} {t}" + ("" if table_exists(cfg, t) else "  (missing: will be skipped)"))
+    import mlflow
+    mlflow.set_experiment(cfg.experiment_path)
+    return cfg
+
+
+# ==============================================================================================
+# PHASE 5: indexing and storage (query the managed AI Search index)
+# ==============================================================================================
+INDEX_COLUMNS = ["chunk_id", "doc_key", "doc_id", "version", "status", "jurisdiction", "authority_rank", "text"]
+
+
+def index_info(cfg: Cfg) -> dict:
+    with open(f"{cfg.work_path}/p5_index.json") as fh:
+        return json.load(fh)
+
+
+def get_index(cfg: Cfg):
+    info = index_info(cfg)
+    return ai_search_client().get_index(endpoint_name=info["endpoint"], index_name=info["index_name"])
+
+
+def index_search(index, query: str, k=5, filters=None, columns=None, query_type=None):
+    """Query the index and return a list of dicts (one per result, with a 'score')."""
+    kw = {"query_text": query, "columns": columns or INDEX_COLUMNS, "num_results": k}
+    if filters: kw["filters"] = filters
+    if query_type: kw["query_type"] = query_type
+    res = index.similarity_search(**kw)
+    cols = [c["name"] for c in res.get("manifest", {}).get("columns", [])]
+    return [dict(zip(cols, row)) for row in res.get("result", {}).get("data_array", []) or []]
+
+
+def index_retrieval_eval(cfg: Cfg, index, filters=None, k=10, query_type=None, planner=None):
+    """Retrieval-only evaluation through the managed index (same metrics as retrieval_eval_ranked).
+    planner: optional function question -> QueryPlan; its rewritten query and filters are used for the search."""
+    import pandas as pd
+    rows = []
+    with open(f"{cfg.work_path}/eval/meridian_eval_set.jsonl") as fh:
+        recs = [json.loads(l) for l in fh if json.loads(l)["expectations"]["expected_doc_ids"]]
+    for r in recs:
+        query, f = r["inputs"]["question"], dict(filters or {})
+        if planner:
+            plan = planner(query)
+            query, f = plan.rewritten, {**f, **plan.filters}
+        hits = index_search(index, query, k=k, filters=f or None, columns=["doc_key"], query_type=query_type)
+        order = [h["doc_key"] for h in hits]
+        exp = set(r["expectations"]["expected_doc_ids"])
+        rec_at = lambda n: len(exp & set(order[:n])) / len(exp)
+        first = next((j + 1 for j, g in enumerate(order) if g in exp), None)
+        version_ok = None
+        versioned = [e for e in exp if "@" in e]
+        if versioned:
+            base = versioned[0].split("@")[0]
+            e_rank = next((j for j, g in enumerate(order) if g in exp and g.startswith(base)), 999)
+            o_rank = next((j for j, g in enumerate(order) if g.startswith(base + "@") and g not in exp), 999)
+            version_ok = e_rank < o_rank
+        rows.append({"question_id": r["tags"]["question_id"], "category": r["tags"]["category"],
+                     "recall@1": rec_at(1), "recall@3": rec_at(3), "recall@5": rec_at(5),
+                     "reciprocal_rank": 1 / first if first else 0.0, "version_ok": version_ok, "top5": order[:5]})
+    return pd.DataFrame(rows)
+
+
+class IndexedRAG(NaiveRAG):
+    """Same prompt and model as NaiveRAG, but retrieval goes through the managed AI Search index."""
+    def __init__(self, cfg: Cfg, k=5, filters=None, query_type=None):
+        import mlflow
+        from mlflow.entities import SpanType
+        self.cfg, self.k, self.filters, self.query_type = cfg, k, filters, query_type
+        self.index = get_index(cfg)
+        self.retrieve = mlflow.trace(span_type=SpanType.RETRIEVER, name="retrieve")(self._retrieve)
+        self.build_prompt = mlflow.trace(span_type=SpanType.PARSER, name="build_prompt")(self._build_prompt)
+        self.generate = mlflow.trace(span_type=SpanType.CHAT_MODEL, name="chat_completion")(self._generate)
+        self.answer = mlflow.trace(span_type=SpanType.CHAIN, name="rag")(self._answer)
+
+    def _retrieve(self, question: str):
+        from mlflow.entities import Document
+        hits = index_search(self.index, question, k=self.k, filters=self.filters, query_type=self.query_type)
+        return [Document(page_content=h["text"], id=h["chunk_id"],
+                         metadata={"doc_uri": h["doc_key"], "chunk_id": h["chunk_id"], "status": h.get("status")})
+                for h in hits]
+
+
+PIPELINES["indexed"] = lambda cfg: IndexedRAG(cfg)
+
+
+def wait_for_index(cfg: Cfg, timeout_s=300):
+    """Wait until the index reports ready. Returns the index, or None if it isn't ready in time."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            idx = get_index(cfg)
+            st = idx.describe().get("status", {})
+            if st.get("ready"):
+                return idx
+            print(f"  index {st.get('detailed_state', 'not ready')} ...")
+        except Exception as e:  # noqa: BLE001
+            print(f"  index not available yet ({str(e)[:80]})")
+        time.sleep(15)
+    return None
+
+
+def guard_lab5():
+    print("Guard check for Lab 5")
+    cfg = load_cfg(); ok("config loaded")
+    life, res = job_status("build_index")
+    if res == "SUCCESS":
+        ok("Index build job finished")
+    elif life in ("PENDING", "RUNNING", "QUEUED", "BLOCKED"):
+        warn("Index build still running. Waiting up to 5 minutes for the index ...")
+    elif life is None:
+        warn("No index build job found. Launch it from 05_embedding (last cell).")
+    else:
+        fail(f"Index build ended with {res or life}. Open the run to see why, and tell a helper.")
+    idx = wait_for_index(cfg, timeout_s=300) if os.path.exists(f"{cfg.work_path}/p5_index.json") or life else None
+    if idx is not None:
+        st = idx.describe().get("status", {})
+        ok(f"Index ready: {st.get('indexed_row_count', '?')} rows")
+    else:
+        warn("Index not ready. Re-run this cell in a few minutes; the rest of the lab needs it.")
+    import mlflow
+    mlflow.set_experiment(cfg.experiment_path)
+    return cfg, idx
+
+
+# ==============================================================================================
+# PHASE 6: query preprocessing (understand the question before searching)
+# ==============================================================================================
+from dataclasses import field as _field
+
+
+@dataclass
+class QueryPlan:
+    original: str
+    rewritten: str
+    filters: dict = _field(default_factory=dict)
+    jurisdiction: str = ""
+    historical: bool = False
+    in_scope: bool = True
+    scope_category: str = "policy"
+    reason: str = ""
+    expanded: list = _field(default_factory=list)
+
+
+_GLOSSARY = None
+
+
+def load_glossary(cfg: Cfg) -> dict:
+    """Acronym -> short expansion, from glossary/acronyms.csv in the workshop volume."""
+    global _GLOSSARY
+    if _GLOSSARY is None:
+        import csv
+        with open(f"{cfg.work_path}/glossary/acronyms.csv") as fh:
+            _GLOSSARY = {r["acronym"]: r["expansion"].split(":")[0].strip() for r in csv.DictReader(fh)}
+    return _GLOSSARY
+
+
+def expand_acronyms(question: str, glossary: dict):
+    """'Do we need SoW for EDD?' -> 'Do we need source of wealth (SoW) for enhanced due diligence (EDD)?'
+    Deterministic: whole-word matches only, and skipped if the long form is already in the question."""
+    out, used = question, []
+    for acr in sorted(glossary, key=len, reverse=True):
+        long = glossary[acr]
+        words = long.split()
+        if len(words) > 1 and not any(w[:1].isupper() for w in words[1:]):
+            long = long[:1].lower() + long[1:]          # 'Source of wealth' -> 'source of wealth'; keep proper names
+        pat = r"(?<![\w/])" + re.escape(acr) + r"(?![\w/])"
+        if re.search(pat, out) and long.lower() not in out.lower():
+            out = re.sub(pat, f"{long} ({acr})", out, count=1)
+            used.append(acr)
+    return out, used
+
+
+JURISDICTION_PATTERNS = {
+    "SG": r"\bsingapore\b|\bSG\b",
+    "HK": r"\bhong kong\b|\bHK\b",
+    "AE": r"\buae\b|\bunited arab emirates\b|\bdubai\b|\babu dhabi\b|\bfree zone\b",
+    "UK": r"\bUK\b|\bunited kingdom\b|\bcompanies house\b|\bbritish\b",
+}
+HISTORICAL_PATTERN = r"\b(before|previous(ly)?|prior to|used to|earlier|old(er)? (rule|policy|version)|what was|what changed|changed in)\b|\b20(1\d|2[0-4])\b"
+
+
+def extract_filters(question: str):
+    """Rules, not a model: jurisdiction mentioned in the question, and whether it asks about the past."""
+    jur = next((j for j, p in JURISDICTION_PATTERNS.items() if re.search(p, question, re.I if j != "UK" else 0)), "")
+    if not jur and re.search(r"\bUAE\b", question):
+        jur = "AE"
+    historical = bool(re.search(HISTORICAL_PATTERN, question, re.I))
+    filters = {"jurisdiction": [jur, "GLOBAL"]} if jur else {}
+    return filters, jur, historical
+
+
+SCOPE_PROMPT = """You route questions for Meridian Global Bank's CIB policy copilot.
+IN SCOPE: Meridian's internal policies, standards, procedures and FAQs on client onboarding and KYC, due diligence (CDD/EDD),
+beneficial ownership, PEPs, sanctions screening, trade finance operations (letters of credit, waivers, SBLCs, collections,
+supply chain finance), credit approval authorities, and onboarding service levels. Questions asking whether to approve
+something are IN SCOPE (the copilot explains the policy).
+OUT OF SCOPE:
+- "hr": staff HR, pay, travel, expenses
+- "market_data": prices, interest rates, FX, market levels
+- "external_text": requests to quote or reproduce external rules, laws or rulebooks word for word
+- "personal_data": requests for personal data about an individual (passport numbers, addresses, dates of birth)
+- "other": anything else unrelated to the topics above
+Reply with JSON only: {"in_scope": true|false, "category": "policy"|"hr"|"market_data"|"external_text"|"personal_data"|"other", "reason": "<short reason>"}"""
+
+
+def classify_scope(cfg: Cfg, question: str) -> dict:
+    """One small LLM call. Fails open (treats the question as in scope) if the reply can't be parsed."""
+    try:
+        text, _ = chat([{"role": "system", "content": SCOPE_PROMPT}, {"role": "user", "content": question}],
+                       cfg, max_tokens=80, temperature=0.0)
+        m = re.search(r"\{.*\}", text, re.S)
+        d = json.loads(m.group(0)) if m else {}
+        return {"in_scope": bool(d.get("in_scope", True)), "category": d.get("category", "policy"), "reason": d.get("reason", "")}
+    except Exception as e:  # noqa: BLE001
+        return {"in_scope": True, "category": "policy", "reason": f"classifier unavailable ({str(e)[:60]})"}
+
+
+def plan_query(cfg: Cfg, question: str, use_llm=True) -> QueryPlan:
+    rewritten, used = expand_acronyms(question, load_glossary(cfg))
+    filters, jur, historical = extract_filters(question)
+    scope = classify_scope(cfg, question) if use_llm else {"in_scope": True, "category": "policy", "reason": ""}
+    return QueryPlan(original=question, rewritten=rewritten, filters=filters, jurisdiction=jur, historical=historical,
+                     in_scope=scope["in_scope"], scope_category=scope["category"], reason=scope["reason"], expanded=used)
+
+
+REFUSALS = {
+    "personal_data": "I can't provide personal identification data about individuals or clients. That information is not disclosed by this copilot.",
+    "external_text": "The policy corpus does not contain that text. Meridian's procedures refer to external rules by name only, so please consult the official source.",
+    "hr": "That's outside the scope of this copilot, which covers Meridian CIB onboarding, KYC, sanctions and trade operations policy. Please check the HR policy portal.",
+    "market_data": "That's outside the scope of this copilot: it doesn't provide market data such as rates or prices.",
+    "other": "That's outside the scope of this copilot, which covers Meridian CIB onboarding, KYC, sanctions and trade operations policy.",
+}
+
+
+class PreprocessedRAG(IndexedRAG):
+    """IndexedRAG plus a traced query plan: acronym expansion, jurisdiction filters, and out-of-scope routing."""
+    def __init__(self, cfg: Cfg, k=5):
+        super().__init__(cfg, k=k)
+        import mlflow
+        from mlflow.entities import SpanType
+        self.plan = mlflow.trace(span_type=SpanType.PARSER, name="plan_query")(self._plan)
+        self.answer = mlflow.trace(span_type=SpanType.CHAIN, name="rag")(self._answer_planned)
+
+    def _plan(self, question: str) -> dict:
+        from dataclasses import asdict as _asdict
+        return _asdict(plan_query(self.cfg, question))
+
+    def _answer_planned(self, question: str) -> str:
+        p = self.plan(question)
+        if not p["in_scope"]:
+            return REFUSALS.get(p["scope_category"], REFUSALS["other"])
+        self.filters = p["filters"] or None
+        docs = self.retrieve(p["rewritten"])
+        return self.generate(self.build_prompt(question, docs))
+
+
+PIPELINES["preprocessed"] = lambda cfg: PreprocessedRAG(cfg)
+
+
+def guard_lab6():
+    print("Guard check for Lab 6")
+    cfg = load_cfg(); ok("config loaded")
+    life, res = job_status("run_evaluation")
+    if res == "SUCCESS":
+        ok("after_p5 evaluation finished")
+    elif life in ("PENDING", "RUNNING", "QUEUED", "BLOCKED"):
+        warn("after_p5 evaluation still running. That's fine: it doesn't block this lab.")
+    idx = wait_for_index(cfg, timeout_s=120)
+    (ok if idx is not None else fail)("AI Search index ready" if idx is not None else "AI Search index not ready: re-run Lab 5's guard")
+    load_glossary(cfg); ok(f"glossary loaded: {len(_GLOSSARY)} acronyms")
+    import mlflow
+    mlflow.set_experiment(cfg.experiment_path)
+    return cfg, idx
+
+
+# ==============================================================================================
+# PHASE 7: retrieval (status default, authority-aware re-ranking, hybrid search)
+# ==============================================================================================
+AUTHORITY_PENALTY = 0.20     # subtracted for rank-4 sources (FAQ, bulletin, reference card)
+JURISDICTION_BONUS = 0.20    # added for the question's own jurisdiction addendum
+RANK_COLUMNS = ["chunk_id", "doc_key", "doc_id", "version", "status", "jurisdiction", "authority_rank", "text"]
+_HYBRID_OK = None
+
+
+@dataclass
+class RetrievalConfig:
+    status_default: bool = True      # filter to current documents unless the plan says the question is historical
+    authority_rerank: bool = True    # re-order candidates by authority and jurisdiction
+    hybrid: bool = False             # keyword + vector search
+    k: int = 5
+    candidates: int = 15
+
+
+def _search_candidates(index, query, filters, n, hybrid):
+    """Fetch n candidates; falls back to vector-only search (once, remembered) if hybrid isn't supported."""
+    global _HYBRID_OK
+    if hybrid and _HYBRID_OK is not False:
+        try:
+            hits = index_search(index, query, k=n, filters=filters, columns=RANK_COLUMNS, query_type="HYBRID")
+            _HYBRID_OK = True
+            return hits, "HYBRID"
+        except Exception as e:  # noqa: BLE001
+            _HYBRID_OK = False
+            warn(f"Hybrid search isn't available here ({str(e)[:100]}); using vector search instead.")
+    return index_search(index, query, k=n, filters=filters, columns=RANK_COLUMNS), "ANN"
+
+
+def authority_rerank(hits, jurisdiction=""):
+    """Re-order candidates: normalise similarity within the candidate set, then adjust for authority.
+    Rank 1 (binding policy, standard, matrix) +0.05; rank 4 (FAQ, bulletin, reference card) -0.20;
+    the question's own jurisdiction addendum +0.20 (an addendum overrides the global rule)."""
+    if not hits:
+        return hits
+    scores = [float(h.get("score") or 0) for h in hits]
+    lo, hi = min(scores), max(scores)
+    out = []
+    for h, sc in zip(hits, scores):
+        norm = (sc - lo) / (hi - lo) if hi > lo else 1.0
+        rank = int(h.get("authority_rank") or 3)
+        adj = (0.05 if rank == 1 else 0.0) - (AUTHORITY_PENALTY if rank >= 4 else 0.0)
+        if jurisdiction and h.get("jurisdiction") == jurisdiction:
+            adj += JURISDICTION_BONUS
+        out.append({**h, "similarity_norm": round(norm, 3), "adjustment": round(adj, 2), "final_score": round(norm + adj, 3)})
+    return sorted(out, key=lambda x: -x["final_score"])
+
+
+def retrieve_ranked(index, plan: QueryPlan, rcfg: RetrievalConfig):
+    """Search with the plan's rewritten query and filters, apply the status default, optionally re-rank by authority."""
+    filters = dict(plan.filters or {})
+    if rcfg.status_default and not plan.historical:
+        filters["status"] = "current"
+    n = rcfg.candidates if rcfg.authority_rerank else rcfg.k
+    hits, mode = _search_candidates(index, plan.rewritten, filters or None, n, rcfg.hybrid)
+    if rcfg.authority_rerank:
+        hits = authority_rerank(hits, plan.jurisdiction)
+    return hits[: rcfg.k], {"filters": filters, "mode": mode, "candidates": n}
+
+
+GRID = {
+    "P6: plan only": RetrievalConfig(status_default=False, authority_rerank=False, hybrid=False),
+    "+ status default": RetrievalConfig(status_default=True, authority_rerank=False, hybrid=False),
+    "+ authority re-rank": RetrievalConfig(status_default=True, authority_rerank=True, hybrid=False),
+    "+ hybrid search": RetrievalConfig(status_default=True, authority_rerank=True, hybrid=True),
+}
+
+
+def retrieval_grid(cfg: Cfg, index, grid=None):
+    """Retrieval-only evaluation of each configuration. Candidate fetches are shared where possible.
+    Extra checks: right version first, and how often a low-authority document (FAQ, bulletin, card) ranks first."""
+    import pandas as pd
+    grid = grid or GRID
+    recs = [json.loads(l) for l in open(f"{cfg.work_path}/eval/meridian_eval_set.jsonl")]
+    recs = [r for r in recs if r["expectations"]["expected_doc_ids"]]
+    plans = {r["tags"]["question_id"]: plan_query(cfg, r["inputs"]["question"], use_llm=False) for r in recs}
+    memo, results = {}, {}
+    for name, rc in grid.items():
+        rows = []
+        for r in recs:
+            qid, plan = r["tags"]["question_id"], plans[r["tags"]["question_id"]]
+            filters = dict(plan.filters or {})
+            if rc.status_default and not plan.historical:
+                filters["status"] = "current"
+            key = (qid, json.dumps(filters, sort_keys=True), rc.hybrid)
+            if key not in memo:
+                memo[key] = _search_candidates(index, plan.rewritten, filters or None, 15, rc.hybrid)[0]
+            hits = memo[key]
+            hits = authority_rerank(hits, plan.jurisdiction) if rc.authority_rerank else hits
+            order = [h["doc_key"] for h in hits[:10]]
+            exp = set(r["expectations"]["expected_doc_ids"])
+            rec_at = lambda n: len(exp & set(order[:n])) / len(exp)
+            first = next((j + 1 for j, g in enumerate(order) if g in exp), None)
+            versioned = [e for e in exp if "@" in e]
+            vok = None
+            if versioned:
+                base = versioned[0].split("@")[0]
+                e_r = next((j for j, g in enumerate(order) if g in exp and g.startswith(base)), 999)
+                o_r = next((j for j, g in enumerate(order) if g.startswith(base + "@") and g not in exp), 999)
+                vok = e_r < o_r
+            rows.append({"question_id": qid, "category": r["tags"]["category"], "recall@1": rec_at(1), "recall@3": rec_at(3),
+                         "recall@5": rec_at(5), "reciprocal_rank": 1 / first if first else 0.0, "version_ok": vok,
+                         "top1_low_authority": bool(hits) and int(hits[0].get("authority_rank") or 3) >= 4,
+                         "top5": order[:5]})
+        results[name] = pd.DataFrame(rows)
+    summary = summarise_models(results).rename(columns={"model": "configuration"})
+    summary["top1_is_FAQ_or_bulletin"] = [f"{int(d.top1_low_authority.sum())}/{len(d)}" for d in results.values()]
+    summary["configuration"] = list(results.keys())
+    return summary, results
+
+
+def p7_config(cfg: Cfg) -> RetrievalConfig:
+    try:
+        with open(f"{cfg.work_path}/p7_config.json") as fh:
+            return RetrievalConfig(**json.load(fh))
+    except FileNotFoundError:
+        return RetrievalConfig()
+
+
+class RetrievalRAG(PreprocessedRAG):
+    """PreprocessedRAG plus the Phase 7 retrieval: status default, authority re-rank, optional hybrid."""
+    def __init__(self, cfg: Cfg, rcfg: RetrievalConfig = None):
+        super().__init__(cfg)
+        import mlflow
+        from mlflow.entities import SpanType
+        self.rcfg = rcfg or p7_config(cfg)
+        self.retrieve_plan = mlflow.trace(span_type=SpanType.RETRIEVER, name="retrieve")(self._retrieve_plan)
+
+    def _retrieve_plan(self, plan_dict: dict):
+        from mlflow.entities import Document
+        plan = QueryPlan(**plan_dict)
+        hits, info = retrieve_ranked(self.index, plan, self.rcfg)
+        return [Document(page_content=h["text"], id=h["chunk_id"],
+                         metadata={"doc_uri": h["doc_key"], "chunk_id": h["chunk_id"], "status": h.get("status"),
+                                   "authority_rank": h.get("authority_rank"), "jurisdiction": h.get("jurisdiction"),
+                                   "search_mode": info["mode"]}) for h in hits]
+
+    def _answer_planned(self, question: str) -> str:
+        p = self.plan(question)
+        if not p["in_scope"]:
+            return REFUSALS.get(p["scope_category"], REFUSALS["other"])
+        docs = self.retrieve_plan(p)
+        return self.generate(self.build_prompt(question, docs))
+
+
+PIPELINES["retrieval"] = lambda cfg: RetrievalRAG(cfg)
+
+
+def guard_lab7():
+    print("Guard check for Lab 7")
+    cfg = load_cfg(); ok("config loaded")
+    life, res = job_status("run_evaluation")
+    if res == "SUCCESS":
+        ok("after_p6 evaluation finished")
+    elif life in ("PENDING", "RUNNING", "QUEUED", "BLOCKED"):
+        warn("after_p6 evaluation still running. It doesn't block this lab.")
+    idx = wait_for_index(cfg, timeout_s=120)
+    (ok if idx is not None else fail)("AI Search index ready" if idx is not None else "AI Search index not ready: re-run Lab 5's guard")
+    load_glossary(cfg)
+    import mlflow
+    mlflow.set_experiment(cfg.experiment_path)
+    return cfg, idx
