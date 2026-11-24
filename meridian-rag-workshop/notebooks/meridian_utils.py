@@ -442,6 +442,25 @@ def get_scorers(cfg: Cfg):
 
 
 
+def _call_scorer(sc, **available):
+    """Call a scorer with only the arguments it declares, the way mlflow.genai.evaluate does.
+    Newer MLflow versions reject arguments a scorer doesn't use (for example 'inputs' for Safety)."""
+    import inspect
+    if hasattr(sc, "run"):
+        try:
+            return sc.run(**available)
+        except TypeError:
+            pass                                   # older Scorer.run signatures: fall back to filtering
+    target = getattr(sc, "func", None) or getattr(sc, "__call__")
+    try:
+        params = inspect.signature(target).parameters
+        if not any(p.kind == p.VAR_KEYWORD for p in params.values()):
+            available = {k: v for k, v in available.items() if k in params}
+    except (TypeError, ValueError):
+        pass
+    return sc(**available)
+
+
 def check_scorers(cfg: Cfg, rag, record):
     """Run every scorer once on a single question and print the result or the full error.
     Takes about 10 seconds, and catches judge problems before a 3-minute evaluation job."""
@@ -454,7 +473,7 @@ def check_scorers(cfg: Cfg, rag, record):
     for sc in get_scorers(cfg):
         name = getattr(sc, "name", type(sc).__name__)
         try:
-            fb = sc(inputs=record["inputs"], outputs=out, expectations=record["expectations"], trace=trace)
+            fb = _call_scorer(sc, inputs=record["inputs"], outputs=out, expectations=record["expectations"], trace=trace)
             fbs = fb if isinstance(fb, list) else [fb]
             vals = [getattr(f, "value", f) for f in fbs]
             errs = [getattr(f, "error", None) for f in fbs if getattr(f, "error", None)]

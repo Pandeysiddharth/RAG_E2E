@@ -202,24 +202,3 @@ launch_job("parse_documents", {}, run_name="meridian-parse-documents")
 # MAGIC | Checked coverage against the eval set | Found a document gap that no later phase could fix |
 # MAGIC | Re-ran the same Auto Loader code | Only the new file was processed: incremental by design |
 # MAGIC | Recorded scope decisions in a registry | Visible, auditable and reversible curation |
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT file_name,
-# MAGIC        e.pos                               AS n,
-# MAGIC        e.value:type::string                AS type,
-# MAGIC        substr(e.value:content::string, 1, 250) AS content
-# MAGIC FROM workspace.meridian_rag.silver_parsed,
-# MAGIC      LATERAL variant_explode(parsed:document:elements) AS e
-# MAGIC WHERE file_name LIKE '%AE_UAE%' OR file_name LIKE '%MAT-032_v2025%'
-# MAGIC ORDER BY file_name, e.pos
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT count(*) AS parsed_files,
-# MAGIC        count_if(parsed:error_status IS NOT NULL) AS with_errors
-# MAGIC FROM workspace.meridian_rag.silver_parsed;
-# MAGIC
-# MAGIC SELECT count(*) AS html_files FROM workspace.meridian_rag.silver_parsed_html;
