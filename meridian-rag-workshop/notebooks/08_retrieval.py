@@ -1,8 +1,4 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "6"
-# ///
 # MAGIC %md
 # MAGIC # Lab 7: Retrieval
 # MAGIC
@@ -151,11 +147,13 @@ display(by_cat.reset_index().rename(columns={"index": "category"}))
 
 # MAGIC %md
 # MAGIC ## Step 7: Choose the configuration
-# MAGIC Keep an improvement only if it helps, or is neutral and makes the system easier to trust.
+# MAGIC Keep an improvement only if it helps, or is neutral and makes the system easier to trust. In the dry run, hybrid search was
+# MAGIC within noise of the re-rank alone on MRR, but it was the only configuration where **no** FAQ or bulletin ranked first, so it
+# MAGIC stays on. If hybrid search isn't available in your workspace, the pipeline falls back to vector search automatically.
 
 # COMMAND ----------
 
-CHOSEN = RetrievalConfig(status_default=True, authority_rerank=True, hybrid=False, k=5, candidates=15)   # edit if your grid says otherwise
+CHOSEN = RetrievalConfig(status_default=True, authority_rerank=True, hybrid=True, k=5, candidates=15)   # edit if your grid says otherwise
 from dataclasses import asdict
 with open(f"{cfg.work_path}/p7_config.json", "w") as fh:
     json.dump(asdict(CHOSEN), fh)
